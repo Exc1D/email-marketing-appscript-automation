@@ -106,7 +106,7 @@ var CAMPAIGN_CONFIG = {
 |----------|---------------|
 | `properCase(name)` | Title-cases names. Converts `CAMPAIGN_CONFIG.acronyms` array to a `Set` internally for O(1) lookup. |
 | `isValidEmail(email)` | **New structural checks** (not in current code): leading/trailing dots in local part, leading dot in domain, consecutive dots, single-char TLD. These are additions to the existing regex + placeholder checks. Returns `false` for structurally broken emails. |
-| `detectTypoDomain(email)` | Extracts domain from email, checks against `CAMPAIGN_CONFIG.typoDomains` map. Returns `{ isTypo: true, suggestion: 'gmail.com' }` or `{ isTypo: false }`. |
+| `detectTypoDomain(email)` | Extracts domain after `@`, checks against `CAMPAIGN_CONFIG.typoDomains` map. Returns `{ isTypo: true, suggestion: 'gmail.com' }` or `{ isTypo: false }`. Assumes `isValidEmail` has already passed (email contains exactly one `@`), so no defensive `@` check needed. |
 | `buildEmail(lead)` | Applies template substitutions. Uses `CAMPAIGN_CONFIG.senderName` for the `name` option in `GmailApp.sendEmail`. Greeting logic: if `CAMPAIGN_CONFIG.useContactPerson` is `true` and `lead.contactPerson` is non-empty, uses first word of contactPerson (proper-cased); otherwise uses company name. |
 | `_getInlineImages()` | Iterates `CAMPAIGN_CONFIG.banners` array, calls `DriveApp.getFileById(b.driveId).getBlob()` for each, returns `{ banner1: blob, banner2: blob, ... }`. |
 
@@ -114,7 +114,7 @@ var CAMPAIGN_CONFIG = {
 
 | Function | Responsibility |
 |----------|---------------|
-| `_doSend(isTest)` | Scans **all** Pending rows in a single pass, batch-marking Invalid and Typo rows, while identifying the first eligible send target. Specifically: for each Pending row — (1) run `isValidEmail`, if invalid collect row index + `'Invalid'`; (2) else run `detectTypoDomain`, if typo collect row index + `'Typo'` + suggestion; (3) else if no send target yet, assign as send target. After the loop, **batch-write** all collected status updates using `getRangeList().setValue()` to avoid per-row API calls (see Performance section). Then send to the target. On send failure, writes `send-error` to the status column (preventing infinite retry). **Bug fix from current code:** The exit check uses `if (lead === null)` instead of the original `if (!targetRowIdx)` which would fail when `targetRowIdx` is `-1`. |
+| `_doSend(isTest)` | Scans **all** Pending rows in a single pass — this is an intentional behavior change from the current code, which stops validating rows after finding the first valid lead. The engine validates every Pending row so that one trigger invocation surfaces all Invalid/Typo rows, not just those before the first valid lead. The operator may see many status changes after a single trigger fire; this is expected and documented in the workflow. **Scan loop:** For each Pending row — (1) run `isValidEmail`, if invalid collect `{ rowIdx, status: 'Invalid' }`; (2) else run `detectTypoDomain`, if typo collect `{ rowIdx, status: 'Typo', email, firmName, suggestion }`; (3) else if no send target yet, assign as send target; else track as `validPendingCount++`. **After the loop:** (a) Batch-write Invalid statuses: build A1-notation array (e.g., `['G5','G12','G47']`) and call `sheet.getRangeList(invalidRanges).setValue('Invalid')`. Separately batch-write Typo statuses: `sheet.getRangeList(typoRanges).setValue('Typo')`. Two calls, one per status value. (b) Write log entries for all typo rows: `logSheet.appendRow([timestamp, row, firmName, email, 'typo: suggested ' + suggestion])` for each. (c) Wrap batch-write + log steps in try/catch — on failure, log the batch-write error and return early (no send attempt). (d) If `lead === null` (no valid target found), log "No pending leads", remove trigger if `!isTest`, and return. (e) Build email via `buildEmail(lead)`, fetch images via `_getInlineImages()`, send via `GmailApp.sendEmail`. On send failure, write `send-error` to status column and log. (f) **Remaining-pending check:** use `validPendingCount - 1` (the target was one of the valid rows) instead of a separate `getValues().filter()` API call. If zero remaining, remove trigger. |
 
 ### Public API
 
@@ -143,7 +143,14 @@ Non-breaking spaces (`\u00a0`) in the subject are normalized to regular spaces a
 ### Batch status writes
 The current code calls `sheet.getRange(row, col).setValue()` per invalid row inside the scan loop. Each call is a separate Sheets API round-trip (~200-500ms). For large lead lists (500+ rows), this risks hitting the 6-minute GAS execution limit.
 
-The engine collects all status updates (Invalid, Typo) during the scan loop, then writes them in a single batch using `sheet.getRangeList(ranges).setValue()` or by building a status column array and writing with `setValues()`. This reduces API calls from O(n) to O(1).
+The engine collects all status updates during the scan loop, grouped by status value. After the loop, it makes two batch-write calls:
+
+1. `sheet.getRangeList(['G5','G12','G47']).setValue('Invalid')` — all Invalid rows in one call.
+2. `sheet.getRangeList(['G8','G23']).setValue('Typo')` — all Typo rows in one call.
+
+`getRangeList()` accepts an array of **A1-notation strings**. The engine constructs these from the status column letter (derived from `CAMPAIGN_CONFIG.columns.status`) and the 1-based row index. `RangeList.setValue()` sets the **same value** across all ranges in the list, which is exactly what we need since all Invalid rows get the same string.
+
+This reduces API calls from O(n) to O(1) per status type (2 calls total).
 
 ## Email Validation
 
@@ -209,7 +216,7 @@ The existing files (`send_emails_gas.js`, `send_emails_sqf_gas.js`) will be **re
 4. Run `sendTest()` to verify with test email
 5. Confirm test → run `installTrigger()`
 6. Monitor Send Log sheet for progress
-7. Trigger auto-removes when all leads are sent
+7. Trigger auto-removes when all leads are sent (or all remaining are Invalid/Typo)
 8. Review Typo and Invalid rows, fix and re-mark as Pending if needed
 
 ### docs/new-campaign-guide.md — Creating a new campaign
@@ -232,6 +239,7 @@ The existing files (`send_emails_gas.js`, `send_emails_sqf_gas.js`) will be **re
 | Banner images broken | Wrong Drive ID or permissions | Verify IDs, set "Anyone with link" |
 | All rows marked Invalid | Email column index wrong | Check `columns.email` |
 | Rows marked Typo | Domain typo detected | Correct email, reset to Pending |
+| Trigger keeps firing after all leads processed | All remaining rows are Invalid/Typo, no valid Pending leads | Trigger auto-removes when `validPendingCount` reaches 0. If stuck, run `_deleteTrigger()` manually. |
 
 ### docs/email-validation-rules.md
 - Each validation check with examples
