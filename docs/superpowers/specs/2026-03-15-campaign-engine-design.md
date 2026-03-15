@@ -40,8 +40,9 @@ Every campaign config file defines one global `CAMPAIGN_CONFIG` object:
 var CAMPAIGN_CONFIG = {
   // Identity
   name: 'FSVP',
-  sender: 'davdlaurence.a.cig@gmail.com',
-  senderName: 'David Laurence',
+  senderName: 'David Laurence',   // Used as the display name in GmailApp.sendEmail's `name` option
+                                   // Note: GAS always sends from the authenticated account's address.
+                                   // To send from an alias, configure it in Gmail Settings > Accounts first.
   cc: 'virginia@consultareinc.com',
   testAddr: 'davidaviado.dla@gmail.com',
 
@@ -67,7 +68,9 @@ var CAMPAIGN_CONFIG = {
   subject: '(Company/Vendor Name) - Are Your Imports Fully FSVP-Compliant? ...',
   bodyHtml: '<p>Hi [First Name/Company Name],</p>...',
 
-  // Greeting strategy
+  // Greeting strategy:
+  // If true and contactPerson is non-empty, use the first word of contactPerson
+  // (proper-cased) as the greeting. Otherwise, fall back to company name.
   useContactPerson: true,
 
   // Typo domain detection map
@@ -87,9 +90,11 @@ var CAMPAIGN_CONFIG = {
 
 **Key design decisions:**
 - `var` instead of `const` to avoid GAS hoisting issues across multiple `.gs` files.
-- `columns` is explicit so campaigns can use spreadsheets with different column layouts.
+- `columns` is explicit so campaigns can use spreadsheets with different column layouts. The engine reads column values via `data[i][CAMPAIGN_CONFIG.columns.email]` etc., replacing the current positional array destructuring.
 - `banners` is an array so the engine handles any count dynamically.
+- `acronyms` is stored as an array in config; the engine converts it to a `Set` internally at the top of `properCase()` for O(1) lookup: `var _acronymSet = new Set(CAMPAIGN_CONFIG.acronyms)`.
 - `typoDomains` lives in config so each campaign can extend the typo list independently.
+- `sender` is intentionally omitted — GAS always sends from the authenticated Google account. To send from a different address, configure a Gmail alias.
 
 ## Engine Architecture
 
@@ -97,17 +102,17 @@ var CAMPAIGN_CONFIG = {
 
 | Function | Responsibility |
 |----------|---------------|
-| `properCase(name)` | Title-cases names, preserving acronyms from `CAMPAIGN_CONFIG.acronyms` |
-| `isValidEmail(email)` | Validates email format + detects structural issues |
-| `detectTypoDomain(email)` | Checks domain against `CAMPAIGN_CONFIG.typoDomains` |
-| `buildEmail(lead)` | Applies template substitutions using config's subject/body + greeting strategy |
-| `_getInlineImages()` | Iterates `CAMPAIGN_CONFIG.banners`, fetches blobs from Drive |
+| `properCase(name)` | Title-cases names. Converts `CAMPAIGN_CONFIG.acronyms` array to a `Set` internally for O(1) lookup. |
+| `isValidEmail(email)` | **New structural checks** (not in current code): leading/trailing dots in local part, leading dot in domain, consecutive dots, single-char TLD. These are additions to the existing regex + placeholder checks. Returns `false` for structurally broken emails. |
+| `detectTypoDomain(email)` | Extracts domain from email, checks against `CAMPAIGN_CONFIG.typoDomains` map. Returns `{ isTypo: true, suggestion: 'gmail.com' }` or `{ isTypo: false }`. |
+| `buildEmail(lead)` | Applies template substitutions. Uses `CAMPAIGN_CONFIG.senderName` for the `name` option in `GmailApp.sendEmail`. Greeting logic: if `CAMPAIGN_CONFIG.useContactPerson` is `true` and `lead.contactPerson` is non-empty, uses first word of contactPerson (proper-cased); otherwise uses company name. |
+| `_getInlineImages()` | Iterates `CAMPAIGN_CONFIG.banners` array, calls `DriveApp.getFileById(b.driveId).getBlob()` for each, returns `{ banner1: blob, banner2: blob, ... }`. |
 
 ### Core
 
 | Function | Responsibility |
 |----------|---------------|
-| `_doSend(isTest)` | Scans sheet for first valid Pending lead, builds email, sends, logs result. Marks invalid/typo rows. |
+| `_doSend(isTest)` | Scans sheet for first valid Pending lead. For each Pending row: (1) run `isValidEmail` — if invalid, mark `Invalid` and continue; (2) run `detectTypoDomain` — if typo, mark `Typo` and log the suggestion, continue; (3) first row passing both checks becomes the send target. Builds email via `buildEmail`, sends via `GmailApp.sendEmail` with `name: CAMPAIGN_CONFIG.senderName`. On send failure, writes `send-error` to the status column (preventing infinite retry) and logs the error. |
 
 ### Public API
 
@@ -117,7 +122,7 @@ var CAMPAIGN_CONFIG = {
 | `sendOneEmail()` | Trigger handler — sends one email per invocation, called every 5 min. |
 | `sendTest()` | Sends to `testAddr` without marking lead as Sent. For manual testing. |
 | `installTrigger()` | Installs (or reinstalls) the 5-minute time trigger. |
-| `_deleteTrigger()` | Internal — removes existing trigger using `CAMPAIGN_CONFIG.name` for identification. |
+| `_deleteTrigger()` | Internal — removes existing trigger by matching handler function name `'sendOneEmail'` via `ScriptApp.getProjectTriggers()`. `CAMPAIGN_CONFIG.name` is used only in log messages, not for trigger identification. |
 
 ## Email Validation
 
@@ -135,13 +140,38 @@ var CAMPAIGN_CONFIG = {
 - Domain matched against `CAMPAIGN_CONFIG.typoDomains` map
 - Log entry includes the suggested correction
 
+### Validation precedence in `_doSend`
+1. **Structural validation first** (`isValidEmail`) — if it fails, mark `Invalid`. Stop.
+2. **Typo detection second** (`detectTypoDomain`) — if typo found, mark `Typo` and log suggested correction. Stop.
+3. If both pass, the row is eligible for sending.
+
 ### Status flow
 ```
 Pending → Sent        (success)
 Pending → Invalid     (structurally broken — no fix possible)
-Pending → Typo        (likely fixable — operator should review)
-Pending → send-error  (sending failed at Gmail API level)
+Pending → Typo        (likely fixable — operator should review and correct)
+Pending → send-error  (Gmail API failure — written to status column to prevent infinite retry)
 ```
+
+**`send-error` behavior change:** The current code only logs send errors without updating the status column, causing failed rows to be retried indefinitely. The engine will now write `send-error` to the status column. To retry, the operator resets status to `Pending` after investigating.
+
+## Migration Plan
+
+The existing files (`send_emails_gas.js`, `send_emails_sqf_gas.js`) will be **removed** from the repository after the new engine + config files are verified working. Migration steps:
+
+1. Create `campaign_engine.gs` and both config files in the repo.
+2. For each GAS project: replace the existing single `.js` file with the engine + config pair.
+3. Run `sendTest()` in each project to verify.
+4. Once confirmed, delete the old `.js` files from the repo in a separate commit.
+
+## Operational Notes
+
+### Gmail sending quota
+- **Consumer Gmail:** 100 emails/day
+- **Google Workspace:** 1,500 emails/day
+- At 5-minute intervals, the trigger can send up to 288 emails/day — this exceeds consumer quota.
+- If campaigns share a Gmail account, they share the quota.
+- The troubleshooting doc will include quota guidance and symptoms of hitting the limit.
 
 ## Documentation
 
