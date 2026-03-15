@@ -64,8 +64,8 @@ var CAMPAIGN_CONFIG = {
   acronyms: ['LLC','INC','CORP','USA','FDA','CBP','USDA','EPA',
              'IOR','FSVP','CO','LTD','PBC','DBA','LP','NA'],
 
-  // Template
-  subject: '(Company/Vendor Name) - Are Your Imports Fully FSVP-Compliant? ...',
+  // Template (see "Template Placeholder Tokens" section below for required tokens)
+  subject: '(Company/Vendor Name) - Are Your Imports Fully FSVP-Compliant? ... - (Date YYYYMMDD - e.g. 20260311)',
   bodyHtml: '<p>Hi [First Name/Company Name],</p>...',
 
   // Greeting strategy:
@@ -87,6 +87,8 @@ var CAMPAIGN_CONFIG = {
   },
 };
 ```
+
+**SQF config differences from FSVP:** The SQF campaign uses `name: 'SQF'`, `sheetName: 'SQF Leads'`, `logSheet: 'SQF Send Log'`, `useContactPerson: false` (always uses company name for greeting), 2 banners instead of 3, and additional acronyms (`'SQF','GFSI','ISO'`). Both campaigns currently share the same `senderName`, `cc`, and `testAddr`.
 
 **Key design decisions:**
 - `var` instead of `const` to avoid GAS hoisting issues across multiple `.gs` files.
@@ -112,17 +114,36 @@ var CAMPAIGN_CONFIG = {
 
 | Function | Responsibility |
 |----------|---------------|
-| `_doSend(isTest)` | Scans sheet for first valid Pending lead. For each Pending row: (1) run `isValidEmail` — if invalid, mark `Invalid` and continue; (2) run `detectTypoDomain` — if typo, mark `Typo` and log the suggestion, continue; (3) first row passing both checks becomes the send target. Builds email via `buildEmail`, sends via `GmailApp.sendEmail` with `name: CAMPAIGN_CONFIG.senderName`. On send failure, writes `send-error` to the status column (preventing infinite retry) and logs the error. |
+| `_doSend(isTest)` | Scans **all** Pending rows in a single pass, batch-marking Invalid and Typo rows, while identifying the first eligible send target. Specifically: for each Pending row — (1) run `isValidEmail`, if invalid collect row index + `'Invalid'`; (2) else run `detectTypoDomain`, if typo collect row index + `'Typo'` + suggestion; (3) else if no send target yet, assign as send target. After the loop, **batch-write** all collected status updates using `getRangeList().setValue()` to avoid per-row API calls (see Performance section). Then send to the target. On send failure, writes `send-error` to the status column (preventing infinite retry). **Bug fix from current code:** The exit check uses `if (lead === null)` instead of the original `if (!targetRowIdx)` which would fail when `targetRowIdx` is `-1`. |
 
 ### Public API
 
 | Function | What it does |
 |----------|-------------|
-| `setup()` | Creates log sheet if missing, installs trigger. Run once after CSV import. |
+| `setup()` | Creates log sheet if missing. Does **not** auto-install the trigger (behavior change from current code). The operator runs `sendTest()` first, then calls `installTrigger()` manually. |
 | `sendOneEmail()` | Trigger handler — sends one email per invocation, called every 5 min. |
 | `sendTest()` | Sends to `testAddr` without marking lead as Sent. For manual testing. |
 | `installTrigger()` | Installs (or reinstalls) the 5-minute time trigger. |
 | `_deleteTrigger()` | Internal — removes existing trigger by matching handler function name `'sendOneEmail'` via `ScriptApp.getProjectTriggers()`. `CAMPAIGN_CONFIG.name` is used only in log messages, not for trigger identification. |
+
+## Template Placeholder Tokens
+
+The engine's `buildEmail` function performs these search-and-replace operations on `subject` and `bodyHtml`. Config authors **must** use these exact tokens in their templates:
+
+| Token | Replaced with | Used in |
+|-------|---------------|---------|
+| `(Company/Vendor Name)` | Proper-cased company name | Subject and body |
+| `[First Name/Company Name]` | Greeting (contact first name or company, per `useContactPerson`) | Body only |
+| `(Date YYYYMMDD...)` | Today's date as `yyyyMMdd` (regex matches any text between parens starting with `Date YYYYMMDD`) | Subject and body |
+
+Non-breaking spaces (`\u00a0`) in the subject are normalized to regular spaces after replacements.
+
+## Performance
+
+### Batch status writes
+The current code calls `sheet.getRange(row, col).setValue()` per invalid row inside the scan loop. Each call is a separate Sheets API round-trip (~200-500ms). For large lead lists (500+ rows), this risks hitting the 6-minute GAS execution limit.
+
+The engine collects all status updates (Invalid, Typo) during the scan loop, then writes them in a single batch using `sheet.getRangeList(ranges).setValue()` or by building a status column array and writing with `setValues()`. This reduces API calls from O(n) to O(1).
 
 ## Email Validation
 
